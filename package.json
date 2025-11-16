@@ -17,10 +17,18 @@
 	"contributes": {
 		"commands": [
 			{
-				"command": "codeTime.reset",
-				"title": "CodeTime: Сбросить статистику"
+				"command": "codeTime.showDashboard",
+				"title": "CodeTime: Open Dashboard"
+			},
+			{
+				"command": "codeTime.exportPDF",
+				"title": "CodeTime: Export to PDF"
 			}
 		]
+	},
+	"dependencies": {
+		"chart.js": "^4.5.1",
+		"html-pdf-node": "^1.0.8"
 	},
 	"scripts": {
 		"compile": "tsc -p ./",
