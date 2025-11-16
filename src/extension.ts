@@ -1,364 +1,921 @@
-import * as fs from 'fs'
+// src/extension.ts
 import * as path from 'path'
 import * as vscode from 'vscode'
 
-/// <reference lib="dom" />
+type Classification = 'manual' | 'paste' | 'ai'
 
-interface CodeFragment {
+interface SnippetRecord {
+	id: string
+	file: string
+	folder: string
+	language: string
 	text: string
-	type: 'typed' | 'copilot' | 'pasted'
+	classification: Classification
 	timestamp: number
+	chars: number
+	lines: number
 }
 
+interface FileStat {
+	file: string
+	folder: string
+	language: string
+	timeSeconds: number
+	chars: number
+	lines: number
+	byClassification: Record<Classification, { chars: number; count: number }>
+	snippets: SnippetRecord[]
+	lastActive?: number
+}
+
+interface LanguageStat {
+	language: string
+	chars: number
+	lines: number
+	timeSeconds: number
+	byClassification: Record<Classification, { chars: number; count: number }>
+}
+
+interface Aggregate {
+	files: Record<string, FileStat>
+	languages: Record<string, LanguageStat>
+	snippets: SnippetRecord[]
+	lastUpdate: number
+}
+
+const STORAGE_KEY = 'codingTracker.v1'
+
 export function activate(context: vscode.ExtensionContext) {
-	console.log('CodeTime Tracker v2.0 Activated')
+	const output = vscode.window.createOutputChannel('CodingTracker')
+	output.appendLine('CodingTracker activated') // load store
 
-	const storagePath = context.globalStorageUri.fsPath
-	if (!fs.existsSync(storagePath))
-		fs.mkdirSync(storagePath, { recursive: true })
+	let store: Aggregate = context.globalState.get<Aggregate>(STORAGE_KEY) || {
+		files: {},
+		languages: {},
+		snippets: [],
+		lastUpdate: Date.now(),
+	}
 
-	const statsFile = path.join(storagePath, 'codetime-stats.json')
-	const fragmentsFile = path.join(storagePath, 'codetime-fragments.json')
-	const achievementsFile = path.join(storagePath, 'achievements.json')
+	const now = () => Date.now()
+	const uid = () => Math.random().toString(36).slice(2, 9)
 
-	let stats: Map<string, number> = new Map()
-	let fragments: CodeFragment[] = []
-	let achievements: string[] = []
-	let lastActivity = Date.now()
-	let isActive = false
-	let sessionStart = 0
-	const idleTimeout = 30 * 1000
-	let idleCheck: NodeJS.Timeout
-	let lastClipboard = ''
-	let lastWasCopilot = false
-	let streak = 0
-	let todayGoal = 120 // 2 hours in minutes
+	function save() {
+		store.lastUpdate = now()
+		void context.globalState.update(STORAGE_KEY, store)
+	}
 
-	// === Load Data ===
-	const load = () => {
-		;[statsFile, fragmentsFile, achievementsFile].forEach(file => {
-			if (fs.existsSync(file)) {
-				const data = fs.readFileSync(file, 'utf-8')
-				const decrypted = Buffer.from(data, 'base64').toString('utf-8')
-				const json = JSON.parse(decrypted)
-				if (file.includes('stats')) stats = new Map(Object.entries(json))
-				if (file.includes('fragments')) fragments = json
-				if (file.includes('achievements')) achievements = json
+	function getFolderFromUri(uri: vscode.Uri) {
+		const ws = vscode.workspace.getWorkspaceFolder(uri)
+		if (ws)
+			return (
+				ws.name + ':' + path.relative(ws.uri.fsPath, path.dirname(uri.fsPath))
+			)
+		return path.dirname(uri.fsPath)
+	}
+
+	function ensureFileStat(
+		filePath: string,
+		language: string,
+		folder: string
+	): FileStat {
+		if (!store.files[filePath]) {
+			store.files[filePath] = {
+				file: filePath,
+				folder,
+				language,
+				timeSeconds: 0,
+				chars: 0,
+				lines: 0,
+				byClassification: {
+					manual: { chars: 0, count: 0 },
+					paste: { chars: 0, count: 0 },
+					ai: { chars: 0, count: 0 },
+				},
+				snippets: [],
+			}
+		}
+		return store.files[filePath]
+	}
+
+	function ensureLanguageStat(language: string): LanguageStat {
+		if (!store.languages[language]) {
+			store.languages[language] = {
+				language,
+				chars: 0,
+				lines: 0,
+				timeSeconds: 0,
+				byClassification: {
+					manual: { chars: 0, count: 0 },
+					paste: { chars: 0, count: 0 },
+					ai: { chars: 0, count: 0 },
+				},
+			}
+		}
+		return store.languages[language]
+	} // Time tracking for active editor
+
+	let lastActiveEditorUri: string | null = null
+	let lastActiveTime = now()
+
+	function setActiveEditor(editor: vscode.TextEditor | undefined) {
+		const t = now()
+		if (lastActiveEditorUri) {
+			const delta = (t - lastActiveTime) / 1000 // seconds
+			const fileStat = store.files[lastActiveEditorUri]
+			if (fileStat) {
+				fileStat.timeSeconds += delta
+				const langStat = ensureLanguageStat(fileStat.language)
+				langStat.timeSeconds += delta
+			}
+		}
+		lastActiveTime = t
+		lastActiveEditorUri = editor?.document.uri.fsPath || null
+		save()
+	}
+
+	setActiveEditor(vscode.window.activeTextEditor)
+
+	context.subscriptions.push(
+		vscode.window.onDidChangeActiveTextEditor(editor => {
+			setActiveEditor(editor)
+		})
+	)
+
+	context.subscriptions.push(
+		vscode.window.onDidChangeWindowState(state => {
+			if (!state.focused) {
+				setActiveEditor(undefined)
+			} else {
+				setActiveEditor(vscode.window.activeTextEditor)
 			}
 		})
-		updateStreak()
-	}
+	) // Heuristics thresholds
 
-	const save = () => {
-		const encrypt = (obj: any) =>
-			Buffer.from(JSON.stringify(obj)).toString('base64')
-		fs.writeFileSync(statsFile, encrypt(Object.fromEntries(stats)))
-		fs.writeFileSync(fragmentsFile, encrypt(fragments))
-		fs.writeFileSync(achievementsFile, encrypt(achievements))
-	}
+	const PASTE_MIN_CHARS = 50
+	const AI_MIN_CHARS = 20
+	const AI_TIME_GAP_MS = 700
 
-	load()
+	let lastChangeTime = 0
+	let lastWasTyping = false
 
-	// === Keys ===
-	const getKey = (type: 'day' | 'week' | 'month'): string => {
-		const d = new Date()
-		if (type === 'day') return d.toISOString().split('T')[0]
-		if (type === 'month')
-			return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
-		const start = new Date(d)
-		start.setDate(d.getDate() - d.getDay() + 1)
-		const year = start.getFullYear()
-		const week = Math.ceil(
-			((start.getTime() - new Date(year, 0, 1).getTime()) / 86400000 + 1) / 7
-		)
-		return `${year}-W${week}`
-	}
+	context.subscriptions.push(
+		vscode.workspace.onDidChangeTextDocument(e => {
+			const doc = e.document
+			const filePath = doc.uri.fsPath
+			const language = doc.languageId || 'unknown'
+			const folder = getFolderFromUri(doc.uri)
+			const fileStat = ensureFileStat(filePath, language, folder)
+			const langStat = ensureLanguageStat(language)
 
-	// === Time Tracking ===
-	const addTime = (seconds: number) => {
-		const keys = ['day', 'week', 'month'].map(t => `${t}:${getKey(t as any)}`)
-		keys.forEach(k => stats.set(k, (stats.get(k) || 0) + seconds))
-		save()
-		updateStatusBar()
-		checkAchievements()
-	}
+			const tNow = now()
 
-	const recordActivity = async () => {
-		const now = Date.now()
-		lastActivity = now
-		if (!isActive) {
-			isActive = true
-			sessionStart = now
-		}
+			for (const ch of e.contentChanges) {
+				const text = ch.text || ''
+				const chars = text.length
+				const lines = text.length > 0 ? text.split(/\r\n|\r|\n/).length : 0
 
-		clearTimeout(idleCheck)
-		idleCheck = setTimeout(() => {
-			if (isActive && now - lastActivity > idleTimeout) {
-				const sessionTime = Math.floor((now - sessionStart) / 1000)
-				if (sessionTime > 5) addTime(sessionTime)
-				isActive = false
-			}
-		}, idleTimeout + 5000)
+				let cls: Classification = 'manual'
 
-		// === Copilot Detection ===
-		const editor = vscode.window.activeTextEditor
-		if (editor) {
-			const doc = editor.document
-			const selection = editor.selection
-			const text = doc.getText(new vscode.Range(selection.start, selection.end))
+				if (chars >= PASTE_MIN_CHARS && ch.rangeLength === 0) {
+					cls = 'paste'
+				} else if (chars >= AI_MIN_CHARS) {
+					const gap = tNow - lastChangeTime
+					if (gap <= AI_TIME_GAP_MS && !lastWasTyping) {
+						cls = 'ai'
+					} else if (gap <= 150 && chars > 0) {
+						cls = 'ai'
+					} else {
+						cls = 'manual'
+					}
+				} else {
+					if (chars <= 1) {
+						cls = 'manual'
+					} else {
+						const gap = tNow - lastChangeTime
+						if (gap <= AI_TIME_GAP_MS && !lastWasTyping) cls = 'ai'
+						else cls = 'manual'
+					}
+				} // Update counters
 
-			if (text && text.length > 3) {
-				let isCopilot = false
-				try {
-					await vscode.commands.executeCommand(
-						'editor.action.inlineSuggest.trigger'
-					)
-					isCopilot = true
-				} catch {
-					isCopilot = false
+				fileStat.chars += chars
+				fileStat.lines += lines
+				fileStat.byClassification[cls].chars += chars
+				fileStat.byClassification[cls].count += 1
+
+				langStat.chars += chars
+				langStat.lines += lines
+				langStat.byClassification[cls].chars += chars
+				langStat.byClassification[cls].count += 1
+
+				if (chars > 0) {
+					const s: SnippetRecord = {
+						id: uid(),
+						file: filePath,
+						folder,
+						language,
+						text:
+							text.length > 1000
+								? text.slice(0, 1000) + '...[truncated]'
+								: text,
+						classification: cls,
+						timestamp: tNow,
+						chars,
+						lines,
+					}
+					fileStat.snippets.push(s)
+					store.snippets.push(s)
 				}
 
-				const type: CodeFragment['type'] = isCopilot
-					? 'copilot'
-					: lastWasCopilot
-					? 'copilot'
-					: 'typed'
-				fragments.push({ text: text.slice(0, 200), type, timestamp: now })
-				lastWasCopilot = isCopilot
+				lastWasTyping = text.length === 1
+				lastChangeTime = tNow
 			}
+
+			save()
+		})
+	)
+
+	context.subscriptions.push(
+		vscode.workspace.onDidCloseTextDocument(_doc => {
+			save()
+		})
+	) // Webview dashboard
+
+	let panel: vscode.WebviewPanel | undefined = undefined
+
+	function createOrShowPanel() {
+		if (panel) {
+			panel.reveal(vscode.ViewColumn.One)
+			sendDataToPanel()
+			return
 		}
-
-		// === Paste Detection ===
-		try {
-			const clipboard = await vscode.env.clipboard.readText()
-			if (clipboard && clipboard !== lastClipboard && clipboard.length > 5) {
-				lastClipboard = clipboard
-				fragments.push({
-					text: clipboard.slice(0, 200),
-					type: 'pasted',
-					timestamp: now,
-				})
+		panel = vscode.window.createWebviewPanel(
+			'codingTracker.dashboard',
+			'Coding Tracker Dashboard',
+			{ viewColumn: vscode.ViewColumn.One, preserveFocus: false },
+			{
+				enableScripts: true,
+				retainContextWhenHidden: true,
 			}
-		} catch {}
+		)
 
-		save()
+		panel.webview.html = getWebviewContent(panel.webview, context.extensionUri)
+		panel.onDidDispose(() => {
+			panel = undefined
+		})
+
+		panel.webview.onDidReceiveMessage(msg => {
+			if (msg.command === 'requestData') {
+				sendDataToPanel()
+			} // Логика очистки данных и экспорта JSON удалена по запросу пользователя.
+		})
+
+		sendDataToPanel()
 	}
 
-	// === Status Bar ===
-	const statusBar = vscode.window.createStatusBarItem(
+	context.subscriptions.push(
+		vscode.commands.registerCommand('codingTracker.openDashboard', () => {
+			createOrShowPanel()
+		})
+	) // Команда 'codingTracker.clearData' полностью удалена по запросу.
+
+	function startOfDay(ts: number) {
+		const d = new Date(ts)
+		d.setHours(0, 0, 0, 0)
+		return d.getTime()
+	}
+
+	function buildTimeWindows() {
+		const t = now()
+		const windows = [
+			{
+				id: 'last12h',
+				from: t - 12 * 3600 * 1000,
+				label: 'Последние 12 часов',
+			},
+			{ id: 'today', from: startOfDay(t), label: 'Сегодня' },
+			{ id: 'week', from: t - 7 * 24 * 3600 * 1000, label: 'За неделю' },
+			{ id: 'month', from: startOfMonth(t), label: 'За месяц' },
+		]
+
+		const results: Record<
+			string,
+			{ seconds: number; chars: number; lines: number }
+		> = {}
+		for (const w of windows) {
+			let chars = 0
+			let lines = 0
+			for (const sn of store.snippets) {
+				if (sn.timestamp >= w.from) {
+					chars += sn.chars
+					lines += sn.lines
+				}
+			}
+
+			const totalChars = Object.values(store.files).reduce(
+				(acc, f) => acc + f.chars,
+				0
+			)
+			const totalSeconds = Object.values(store.files).reduce(
+				(acc, f) => acc + f.timeSeconds,
+				0
+			)
+			const sec = totalChars > 0 ? (chars / totalChars) * totalSeconds : 0
+
+			results[w.id] = { seconds: Math.round(sec), chars, lines }
+		}
+
+		return results
+	}
+
+	function buildExtraStats() {
+		const DAY_MS = 24 * 3600 * 1000
+		const today = startOfDay(now())
+		let currentStreak = 0
+		let maxStreak = 0
+		let lastDay = 0 // Sort snippets to process chronologically
+
+		const sortedSnippets = [...store.snippets].sort(
+			(a, b) => a.timestamp - b.timestamp
+		)
+
+		const activityDays: Set<number> = new Set()
+		const weekdayCounts = Array(7).fill(0) // 0=Sunday, 6=Saturday // 1. Calculate Activity Days and Weekday Counts
+
+		for (const sn of sortedSnippets) {
+			const day = startOfDay(sn.timestamp)
+			activityDays.add(day)
+
+			const d = new Date(sn.timestamp)
+			weekdayCounts[d.getDay()]++
+		} // 2. Calculate Streak
+
+		const uniqueDays = Array.from(activityDays).sort((a, b) => a - b)
+
+		for (const day of uniqueDays) {
+			if (day === lastDay + DAY_MS || lastDay === 0) {
+				currentStreak++
+			} else if (day !== lastDay) {
+				maxStreak = Math.max(maxStreak, currentStreak)
+				currentStreak = 1
+			}
+			lastDay = day
+		}
+		maxStreak = Math.max(maxStreak, currentStreak) // Adjust current streak if today is not an active day
+
+		const yesterday = today - DAY_MS
+		const isActiveToday = activityDays.has(today)
+		const isActiveYesterday = activityDays.has(yesterday)
+
+		if (lastDay === today) {
+			// currentStreak is correct
+		} else if (lastDay === yesterday) {
+			// currentStreak is correct, but since lastDay < today, it's the streak until yesterday
+			// This logic is slightly complex to do reliably outside of a proper date loop, but the above loop handles it:
+			// If the last active day was yesterday, and today is counted, the loop adds +1.
+			// We must subtract 1 if the very last day processed was yesterday and today is inactive.
+			if (!isActiveToday && currentStreak > 0) {
+				// Find the streak *ending* yesterday.
+				let tempStreak = 0
+				let currentDay = yesterday
+				while (activityDays.has(currentDay)) {
+					tempStreak++
+					currentDay -= DAY_MS
+				}
+				currentStreak = tempStreak
+			}
+		} else {
+			// Last active day was before yesterday or 0, current streak is 0
+			currentStreak = isActiveToday ? 1 : 0
+		}
+
+		return {
+			totalEdits: store.snippets.length,
+			currentStreak: Math.max(0, currentStreak), // Ensure non-negative
+			maxStreak: Math.max(0, maxStreak), // Ensure non-negative
+			weekdayCounts: weekdayCounts,
+		}
+	}
+
+	function sendDataToPanel() {
+		if (!panel) return
+		const builds = buildTimeWindows()
+		const extraStats = buildExtraStats()
+		panel.webview.postMessage({
+			command: 'update',
+			payload: {
+				store,
+				timeWindows: builds,
+				extraStats: extraStats,
+			},
+		})
+	}
+
+	function startOfMonth(ts: number) {
+		const d = new Date(ts)
+		d.setDate(1)
+		d.setHours(0, 0, 0, 0)
+		return d.getTime()
+	}
+
+	const item = vscode.window.createStatusBarItem(
 		vscode.StatusBarAlignment.Left,
 		100
 	)
-	statusBar.text = '$(clock) CodeTime: 0 min'
-	statusBar.command = 'codeTime.showDashboard'
-	statusBar.show()
-	context.subscriptions.push(statusBar)
+	item.text = '$(graph) CodingTracker'
+	item.command = 'codingTracker.openDashboard'
+	item.show()
+	context.subscriptions.push(item)
 
-	const updateStatusBar = () => {
-		const today = getKey('day')
-		const minutes = Math.floor((stats.get(`day:${today}`) || 0) / 60)
-		const goal = minutes >= todayGoal ? '$(check)' : '$(circle-outline)'
-		statusBar.text = `${goal} CodeTime: ${minutes} min`
-	}
-
-	// === Dashboard ===
-	const showDashboard = () => {
-		const panel = vscode.window.createWebviewPanel(
-			'codeTimeDashboard',
-			'CodeTime Dashboard',
-			vscode.ViewColumn.One,
-			{ enableScripts: true, retainContextWhenHidden: true }
-		)
-
-		panel.webview.html = getDashboardHTML()
-	}
-
-	const getDashboardHTML = () => {
-		const theme = vscode.window.activeColorTheme.kind === 1 ? 'light' : 'dark'
-		const bg = theme === 'dark' ? '#1e1e1e' : '#ffffff'
-		const fg = theme === 'dark' ? '#cccccc' : '#333333'
-
-		const dayData = getLast7Days()
-		const weekMins = Math.floor((stats.get(`week:${getKey('week')}`) || 0) / 60)
-		const monthMins = Math.floor(
-			(stats.get(`month:${getKey('month')}`) || 0) / 60
-		)
-		const todayMins = Math.floor((stats.get(`day:${getKey('day')}`) || 0) / 60)
-
-		return `
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <meta charset="UTF-8">
-      <title>CodeTime Dashboard</title>
-      <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-      <style>
-        body { font-family: system-ui; background: ${bg}; color: ${fg}; padding: 20px; }
-        .card { background: ${
-					theme === 'dark' ? '#2d2d2d' : '#f9f9f9'
-				}; padding: 16px; border-radius: 12px; margin: 12px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-        .summary { display: flex; justify-content: space-around; text-align: center; }
-        .value { font-size: 28px; font-weight: bold; }
-        .label { font-size: 14px; opacity: 0.8; }
-        canvas { height: 220px !important; }
-        .code { font-family: 'Courier New'; font-size: 12px; white-space: pre-wrap; }
-        .typed { color: #4ade80; }
-        .copilot { color: #fbbf24; }
-        .pasted { color: #f87171; }
-        .achievements { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
-        .badge { background: #6366f1; color: white; padding: 4px 8px; border-radius: 8px; font-size: 12px; }
-        button { background: #10b981; color: white; border: none; padding: 10px 16px; border-radius: 8px; cursor: pointer; margin-top: 16px; }
-      </style>
-    </head>
-    <body>
-      <h1>CodeTime Dashboard</h1>
-
-      <div class="card summary">
-        <div>
-          <div class="value">${todayMins}</div>
-          <div class="label">Today</div>
-        </div>
-        <div>
-          <div class="value">${weekMins}</div>
-          <div class="label">This Week</div>
-        </div>
-        <div>
-          <div class="value">${monthMins}</div>
-          <div class="label">This Month</div>
-        </div>
-        <div>
-          <div class="value">${streak}</div>
-          <div class="label">Streak</div>
-        </div>
-      </div>
-
-      <div class="card">
-        <h3>Last 7 Days</h3>
-        <canvas id="chart"></canvas>
-      </div>
-
-      <div class="card">
-        <h3>Code Origin</h3>
-        <div class="code">
-          ${fragments
-						.slice(-20)
-						.reverse()
-						.map(
-							f =>
-								`<div class="${f.type}">[${new Date(
-									f.timestamp
-								).toLocaleTimeString()}] ${f.text}</div>`
-						)
-						.join('')}
-        </div>
-      </div>
-
-      <div class="card">
-        <h3>Achievements</h3>
-        <div class="achievements">
-          ${
-						achievements.map(a => `<span class="badge">${a}</span>`).join('') ||
-						'<i>None yet</i>'
-					}
-        </div>
-      </div>
-
-      <button onclick="exportPDF()">Export to PDF</button>
-
-      <script>
-        new Chart(document.getElementById('chart'), {
-          type: 'bar',
-          data: {
-            labels: ${JSON.stringify(dayData.map(d => d.label))},
-            datasets: [{
-              label: 'Minutes',
-              data: ${JSON.stringify(dayData.map(d => d.value))},
-              backgroundColor: '#10b981'
-            }]
-          },
-          options: { responsive: true, scales: { y: { beginAtZero: true } } }
-        });
-
-        function exportPDF() {
-          window.print();
-        }
-      </script>
-    </body>
-    </html>`
-	}
-
-	const getLast7Days = () => {
-		const result = []
-		for (let i = 6; i >= 0; i--) {
-			const d = new Date()
-			d.setDate(d.getDate() - i)
-			const key = d.toISOString().split('T')[0]
-			result.push({
-				label: d.toLocaleDateString('en-US', { weekday: 'short' }),
-				value: Math.floor((stats.get(`day:${key}`) || 0) / 60),
-			})
-		}
-		return result
-	}
-
-	// === Streak & Achievements ===
-	const updateStreak = () => {
-		const today = getKey('day')
-		const yesterday = new Date()
-		yesterday.setDate(yesterday.getDate() - 1)
-		const yKey = yesterday.toISOString().split('T')[0]
-		const todayMins = Math.floor((stats.get(`day:${today}`) || 0) / 60)
-		const yesterdayMins = Math.floor((stats.get(`day:${yKey}`) || 0) / 60)
-
-		if (todayMins >= todayGoal && yesterdayMins >= todayGoal) {
-			streak = (streak || 0) + 1
-		} else if (todayMins < todayGoal) {
-			streak = 0
-		}
-	}
-
-	const checkAchievements = () => {
-		const totalMins = Math.floor(
-			Array.from(stats.values()).reduce((a, b) => a + b, 0) / 60
-		)
-		const todayMins = Math.floor((stats.get(`day:${getKey('day')}`) || 0) / 60)
-		const copilotCount = fragments.filter(f => f.type === 'copilot').length
-		const noCopilotDay = todayMins >= 60 && copilotCount === 0
-
-		const newAchievements = []
-		if (totalMins >= 1000 && !achievements.includes('1000 Minutes Coded'))
-			newAchievements.push('1000 Minutes Coded')
-		if (streak >= 5 && !achievements.includes('5-Day Streak'))
-			newAchievements.push('5-Day Streak')
-		if (noCopilotDay && !achievements.includes('Pure Coder'))
-			newAchievements.push('Pure Coder')
-
-		if (newAchievements.length > 0) {
-			achievements.push(...newAchievements)
+	context.subscriptions.push({
+		dispose: () => {
 			save()
-			vscode.window.showInformationMessage(
-				`Achievement Unlocked: ${newAchievements.join(', ')}!`
-			)
-		}
+		},
+	})
+
+	function getWebviewContent(webview: vscode.Webview, _extUri: vscode.Uri) {
+		const nonce = uid()
+		const chartJs = `
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+ `
+
+		return `<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: https:; script-src 'nonce-${nonce}' https://cdn.jsdelivr.net; style-src 'unsafe-inline';">
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Панель мониторинга Coding Tracker</title>
+<style>
+ :root {
+  --bg: #0f1724;
+  --card: #1a2332;
+  --border: #2d3748;
+  --text: #e2e8f0;
+  --text-muted: #94a3b8;
+  --accent: #60a5fa;
+  --ai: #ff5c5c;
+  --paste: #fbbf24;
+  --manual: #34d399;
+ }
+ body { 
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+  margin: 0; padding: 16px; 
+  color: var(--text); background: var(--bg); 
+  line-height: 1.5;
+ }
+ h1 { font-size: 1.5rem; margin: 0 0 12px; color: #fff; display: flex; align-items: center; gap: 8px; }
+ h2 { font-size: 1.1rem; margin: 16px 0 8px; color: #fff; font-weight: 600; }
+ .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 16px; }
+ .chart-grid { display: grid; grid-template-columns: 1.2fr 1fr; gap: 16px; margin-bottom: 16px; }
+
+ .card { 
+  background: var(--card); 
+  border-radius: 12px; 
+  padding: 16px; 
+  border: 1px solid var(--border); 
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  transition: transform 0.2s, box-shadow 0.2s;
+ }
+ .card:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(0,0,0,0.4); }
+ .controls { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+ button { 
+  padding: 8px 12px; border-radius: 8px; background: #1e293b; color: #cbd5e1; 
+  border: 1px solid var(--border); cursor: pointer; font-size: 0.9rem; 
+  transition: all 0.2s;
+ }
+ button:hover { background: #334155; transform: translateY(-1px); }
+ .stat { font-size: 1.8rem; font-weight: 700; margin: 4px 0; color: var(--accent); }
+ .small { font-size: 0.85rem; color: var(--text-muted); }
+ table { width:100%; border-collapse: collapse; font-size: 0.9rem; }
+ th, td { padding: 6px 8px; text-align: left; }
+ th { color: var(--text-muted); font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.5px; }
+ tr:hover td { background: rgba(255,255,255,0.03); }
+ .lang-tag { font-weight: 700; color: #e0f2fe; }
+ .snippet { 
+  white-space: pre-wrap; padding: 8px; border-radius: 6px; margin: 6px 0; 
+  font-family: 'JetBrains Mono', monospace; font-size: 11px; line-height: 1.4;
+  max-height: 120px; overflow: auto;
+ }
+ .cls-paste { background: rgba(251,191,36,0.08); border-left: 3px solid var(--paste); }
+ .cls-ai { background: rgba(239,68,68,0.08); border-left: 3px solid var(--ai); }
+ .cls-manual { background: rgba(52,211,153,0.08); border-left: 3px solid var(--manual); }
+ details { margin: 8px 0; }
+ summary { 
+  cursor: pointer; padding: 8px; background: rgba(255,255,255,0.03); 
+  border-radius: 6px; font-weight: 600; font-size: 0.95rem;
+ }
+ summary:hover { background: rgba(255,255,255,0.06); }
+ .chart-container { position: relative; height: 180px; margin: 12px 0; }
+ .heatmap { display: grid; grid-template-columns: repeat(24, 1fr); gap: 2px; margin: 12px 0; }
+ .hour { width: 100%; height: 20px; background: #334155; border-radius: 2px; }
+ .hour.active { background: var(--accent); }
+ .hour.hot { background: #60a5fa; }
+ .hour.very-hot { background: #3b82f6; }
+ .top-item { display: flex; justify-content: space-between; padding: 4px 0; font-size: 0.9rem; align-items: center; }
+ .progress { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; margin-top: 4px; }
+ .progress-bar { height: 100%; border-radius: 3px; }
+ .legend-item { display: flex; justify-content: space-between; padding: 4px 0; font-size: 0.9rem; align-items: center; }
+ .legend-item span:first-child { display: flex; align-items: center; }
+ .color-box { width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; }
+ @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+ .fade-in { animation: fadeIn 0.4s ease-out; }
+</style>
+${chartJs}
+</head>
+<body>
+ <h1>Панель мониторинга Coding Tracker</h1>
+ <div class="controls">
+  <button id="refresh">Обновить</button>
+ </div>
+
+ <div class="grid">
+  <div class="card fade-in">
+   <h2>Отслеживание времени</h2>
+   <div id="timeWindows">Загрузка…</div>
+  </div>
+  <div class="card fade-in">
+   <h2>Статистика сессии</h2>
+   <div id="sessionInfo">—</div>
+  </div>
+ </div>
+
+ <div class="grid">
+  <div class="card fade-in">
+   <h2>Серии активности</h2>
+   <div id="streakInfo">—</div>
+  </div>
+  <div class="card fade-in">
+   <h2>Общие изменения</h2>
+   <div id="totalEditsInfo">—</div>
+  </div>
+ </div>
+
+ <h2>Разбивка по вкладу</h2>
+ <div class="chart-grid">
+  <div class="card fade-in">
+   <h3>Классификация (Символы)</h3>
+   <div id="classificationChart" class="chart-container">
+    <canvas id="classChart"></canvas>
+   </div>
+  </div>
+  <div class="card fade-in" id="classificationLegend">
+   <h3>Сводка</h3>
+   <div id="classSummary">Загрузка...</div>
+  </div>
+ </div>
+
+ <h2>Доминирование языков</h2>
+ <div class="chart-grid">
+  <div class="card fade-in">
+   <h3>Топ языков (Символы)</h3>
+   <div id="langChart" class="chart-container">
+    <canvas id="langPie"></canvas>
+   </div>
+  </div>
+  <div class="card fade-in" id="languageLegend">
+   <h3>Топ-5 языков</h3>
+   <div id="langSummary">Загрузка...</div>
+  </div>
+ </div>
+
+ <div class="card fade-in" style="margin-top: 16px;">
+  <h2>Активность по дням недели</h2>
+  <div id="weekdayChart" class="chart-container">
+   <canvas id="weekDayChart"></canvas>
+  </div>
+ </div>
+
+
+ <div class="grid">
+  <div class="card fade-in">
+   <h2>Топ-5 файлов</h2>
+   <div id="topFiles">—</div>
+  </div>
+  <div class="card fade-in">
+   <h2>Топ-5 папок</h2>
+   <div id="topFolders">—</div>
+   </div>
+ </div>
+
+ <div class="card fade-in" style="margin-top: 16px;">
+  <h2>Почасовая активность (Последние 30 дней)</h2>
+  <div class="heatmap" id="heatmap"></div>
+  <div class="small" style="margin-top: 8px;">Активность на основе количества фрагментов кода в час.</div>
+ </div>
+
+ <div class="card fade-in" style="margin-top: 16px;">
+  <h2>Языки (Подробная таблица)</h2>
+  <table id="langTable">
+   <thead><tr><th>Язык</th><th>Символы</th><th>Время</th><th>ИИ</th><th>Вставка</th><th>Вручную</th></tr></thead>
+   <tbody></tbody>
+  </table>
+ </div>
+
+ <div class="card fade-in" style="margin-top: 16px;">
+  <h2>Недавние фрагменты кода</h2>
+  <div id="accordion">Загрузка…</div>
+ </div>
+
+<script nonce="${nonce}">
+ const vscode = acquireVsCodeApi();
+ let classChart = null, langPie = null, weeklyChart = null;
+
+ function msToTime(s) {
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.round(s % 60);
+  return h > 0 ? \`\${h}ч \${m}м\` : m > 0 ? \`\${m}м \${sec}с\` : \`\${sec}с\`;
+ }
+
+ function formatNumber(n) { return n.toLocaleString('ru-RU'); }
+
+ document.getElementById('refresh').onclick = () => vscode.postMessage({ command: 'requestData' });
+
+ window.addEventListener('message', e => {
+  const { store, timeWindows, extraStats } = e.data.payload;
+  renderAll(store, timeWindows, extraStats);
+ });
+
+ function renderAll(store, tw, extraStats) {
+  renderTimeWindows(tw);
+  renderSession(store);
+  renderStreakInfo(extraStats);
+  renderTotalEditsInfo(extraStats);
+  renderClassificationChart(store);
+  renderLangPie(store);
+  renderWeeklyActivity(extraStats);
+  renderTopFiles(store);
+  renderTopFolders(store);
+  renderHeatmap(store);
+  renderLangTable(store.languages);
+  renderAccordion(store);
+ }
+
+ function renderTimeWindows(tw) {
+  const el = document.getElementById('timeWindows');
+  el.innerHTML = '';
+  const labels = { last12h: 'Последние 12 часов', today: 'Сегодня', week: 'За неделю', month: 'За месяц' };
+  for (const k of ['last12h','today','week','month']) {
+   const it = tw[k];
+   const div = document.createElement('div');
+   div.innerHTML = \`<strong>\${labels[k]}</strong>: \${msToTime(it.seconds)} — \${formatNumber(it.chars)} Символов\`;
+   el.appendChild(div);
+  }
+ }
+
+ function renderSession(store) {
+  const totalTime = Object.values(store.files).reduce((a,f) => a + f.timeSeconds, 0);
+  const totalChars = Object.values(store.languages).reduce((a,l) => a + l.chars, 0);
+  const speed = totalTime > 0 ? Math.round(totalChars / totalTime * 60) : 0;
+  const el = document.getElementById('sessionInfo');
+  el.innerHTML = \`
+   <div><strong class="stat">\${msToTime(totalTime)}</strong> Общее время</div>
+   <div class="small">\${formatNumber(speed)} Символов/мин</div>
+   <div class="small">Последнее обновление: \${new Date(store.lastUpdate).toLocaleTimeString('ru-RU')}</div>
+  \`;
+ }
+
+ function renderStreakInfo(extraStats) {
+  const el = document.getElementById('streakInfo');
+  el.innerHTML = \`
+   <div><strong class="stat">\${formatNumber(extraStats.currentStreak)}</strong> Дней подряд</div>
+   <div class="small">Максимальная серия: \${formatNumber(extraStats.maxStreak)} дней</div>
+   <div class="small">Активные дни — это дни с хотя бы одним фрагментом кода.</div>
+  \`;
+ }
+
+ function renderTotalEditsInfo(extraStats) {
+  const el = document.getElementById('totalEditsInfo');
+  el.innerHTML = \`
+   <div><strong class="stat">\${formatNumber(extraStats.totalEdits)}</strong> Общее количество фрагментов</div>
+   <div class="small">Каждый фрагмент — это одно изменение содержимого.</div>
+  \`;
+ }
+
+ function renderClassificationChart(store) {
+  const data = { ai: 0, paste: 0, manual: 0 };
+  for (const l of Object.values(store.languages)) {
+   data.ai += l.byClassification.ai.chars;
+   data.paste += l.byClassification.paste.chars;
+   data.manual += l.byClassification.manual.chars;
+  }
+  
+  const totalChars = data.ai + data.paste + data.manual;
+  
+  const ctx = document.getElementById('classChart').getContext('2d');
+  if (classChart) classChart.destroy();
+  classChart = new Chart(ctx, {
+   type: 'doughnut',
+   data: {
+    labels: ['ИИ', 'Вставка', 'Вручную'],
+    datasets: [{
+     data: [data.ai, data.paste, data.manual],
+     backgroundColor: ['var(--ai)', 'var(--paste)', 'var(--manual)'],
+     borderWidth: 0
+    }]
+   },
+   options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
+  });
+
+  // Summary Legend
+  const summaryEl = document.getElementById('classSummary');
+  summaryEl.innerHTML = \`
+   \${renderLegendItem('ИИ (AI)', data.ai, totalChars, 'var(--ai)')}
+   \${renderLegendItem('Вставка (Paste)', data.paste, totalChars, 'var(--paste)')}
+   \${renderLegendItem('Вручную (Manual)', data.manual, totalChars, 'var(--manual)')}
+  \`;
+ }
+
+ function renderLangPie(store) {
+  const langs = Object.values(store.languages).filter(l => l.chars > 0).sort((a,b) => b.chars - a.chars);
+  const topLangs = langs.slice(0, 5);
+  const otherChars = langs.slice(5).reduce((a,l) => a + l.chars, 0);
+  
+  const colors = ['#60a5fa','#a78bfa','#f472b6','#fb923c','#facc15','#94a3b8']; // 5 for top, 1 for other
+  
+  let chartData = topLangs.map(l => l.chars);
+  let chartLabels = topLangs.map(l => l.language);
+  
+  if (otherChars > 0) {
+   chartData.push(otherChars);
+   chartLabels.push('Другие');
+  }
+
+  const ctx = document.getElementById('langPie').getContext('2d');
+  if (langPie) langPie.destroy();
+  langPie = new Chart(ctx, {
+   type: 'pie',
+   data: {
+    labels: chartLabels,
+    datasets: [{
+     data: chartData,
+     backgroundColor: colors.slice(0, chartData.length),
+     borderWidth: 0
+    }]
+   },
+   options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
+  });
+
+  // Summary Legend
+  const summaryEl = document.getElementById('langSummary');
+  const totalChars = langs.reduce((a,l) => a + l.chars, 0);
+  
+  let html = '';
+  for (let i = 0; i < topLangs.length; i++) {
+   html += renderLegendItem(topLangs[i].language, topLangs[i].chars, totalChars, colors[i]);
+  }
+  if (otherChars > 0) {
+   html += renderLegendItem('Другие', otherChars, totalChars, colors[topLangs.length]);
+  }
+  summaryEl.innerHTML = html;
+ }
+ 
+ function renderLegendItem(label, chars, total, color) {
+  const percent = total > 0 ? Math.round((chars / total) * 100) : 0;
+  return \`
+   <div class="legend-item">
+    <span><div class="color-box" style="background: \${color};"></div> \${escapeHtml(label)}</span>
+    <span>\${formatNumber(chars)} (\${percent}%)</span>
+   </div>
+   <div class="progress"><div class="progress-bar" style="width: \${percent}%; background: \${color};"></div></div>
+  \`;
+ }
+
+ function renderWeeklyActivity(extraStats) {
+  const ctx = document.getElementById('weekDayChart').getContext('2d');
+  if (weeklyChart) weeklyChart.destroy();
+  
+  // Labels: Пн, Вт, Ср, Чт, Пт, Сб, Вс
+  const labels = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
+  const data = [...extraStats.weekdayCounts];
+  
+  // Shift data: [Вс, Пн, Вт, Ср, Чт, Пт, Сб] -> [Пн, Вт, Ср, Чт, Пт, Сб, Вс]
+  const shiftedData = [...data.slice(1), data[0]];
+
+  weeklyChart = new Chart(ctx, {
+   type: 'bar',
+   data: {
+    labels: labels,
+    datasets: [{
+     label: 'Фрагменты кода',
+     data: shiftedData,
+     backgroundColor: 'var(--accent)',
+     borderColor: 'var(--accent)',
+     borderWidth: 1
+    }]
+   },
+   options: { 
+    responsive: true, 
+    maintainAspectRatio: false,
+    plugins: { 
+     legend: { display: false } 
+    },
+    scales: {
+     x: { grid: { display: false } },
+     y: { beginAtZero: true, ticks: { precision: 0 } }
+    }
+   }
+  });
+ }
+
+ function renderTopFiles(store) {
+  const files = Object.values(store.files).sort((a,b) => b.timeSeconds - a.timeSeconds).slice(0,5);
+  const el = document.getElementById('topFiles');
+  el.innerHTML = files.map(f => {
+   const name = f.file.split(/[\\/]/).pop();
+   return \`<div class="top-item"><span>\${name}</span><span>\${msToTime(Math.round(f.timeSeconds))}</span></div>\`;
+  }).join('');
+ }
+
+ function renderTopFolders(store) {
+  const folders = {};
+  for (const f of Object.values(store.files)) {
+   folders[f.folder] = (folders[f.folder] || 0) + f.timeSeconds;
+  }
+  const top = Object.entries(folders).sort((a,b) => b[1] - a[1]).slice(0,5);
+  const el = document.getElementById('topFolders');
+  el.innerHTML = top.map(([f,t]) => \`<div class="top-item"><span>\${f}</span><span>\${msToTime(Math.round(t))}</span></div>\`).join('');
+ }
+
+ function renderHeatmap(store) {
+  const DAY_MS = 24 * 3600 * 1000;
+  const THIRTY_DAYS_AGO = Date.now() - 30 * DAY_MS;
+  
+  const hours = Array(24).fill(0);
+  for (const sn of store.snippets) {
+   if (sn.timestamp >= THIRTY_DAYS_AGO) { // Filter for the last 30 days
+    const d = new Date(sn.timestamp);
+    hours[d.getHours()]++;
+   }
+  }
+  
+  const max = Math.max(...hours, 1);
+  const el = document.getElementById('heatmap');
+  el.innerHTML = hours.map((c, i) => {
+   const intensity = c === 0 ? '' : c > max * 0.7 ? 'very-hot' : c > max * 0.3 ? 'hot' : 'active';
+   return \`<div class="hour \${intensity}" title="\${i}:00 — \${c} всего изменений"></div>\`;
+  }).join('');
+ }
+
+ function renderLangTable(langs) {
+  const tbody = document.querySelector('#langTable tbody');
+  tbody.innerHTML = '';
+  const arr = Object.values(langs).sort((a,b) => b.chars - a.chars);
+  for (const l of arr) {
+   const row = document.createElement('tr');
+   row.innerHTML = \`
+    <td class="lang-tag">\${escapeHtml(l.language)}</td>
+    <td>\${formatNumber(l.chars)}</td>
+    <td>\${msToTime(l.timeSeconds)}</td>
+    <td>\${formatNumber(l.byClassification.ai.chars)}</td>
+    <td>\${formatNumber(l.byClassification.paste.chars)}</td>
+    <td>\${formatNumber(l.byClassification.manual.chars)}</td>
+   \`;
+   tbody.appendChild(row);
+  }
+ }
+
+ function renderAccordion(store) {
+  const acc = document.getElementById('accordion');
+  acc.innerHTML = '';
+  const byFolder = {};
+  for (const f of Object.values(store.files)) {
+   if (!byFolder[f.folder]) byFolder[f.folder] = [];
+   byFolder[f.folder].push(f);
+  }
+  for (const [folder, files] of Object.entries(byFolder)) {
+   const det = document.createElement('details');
+   const sum = document.createElement('summary');
+   sum.textContent = folder + ' (' + files.length + ' файлов)';
+   det.appendChild(sum);
+   for (const file of files) {
+    const d2 = document.createElement('details');
+    const s2 = document.createElement('summary');
+    s2.textContent = file.file.split(/[\\/]/).pop() + ' — ' + msToTime(Math.round(file.timeSeconds));
+    d2.appendChild(s2);
+    // Only show the last 30 snippets
+    for (const sn of file.snippets.slice(-30)) {
+     const pre = document.createElement('pre');
+     pre.className = 'snippet ' + (sn.classification === 'paste' ? 'cls-paste' : sn.classification === 'ai' ? 'cls-ai' : 'cls-manual');
+     // Truncate text to 1500 chars for display
+     pre.textContent = sn.text.slice(0, 1500);
+     d2.appendChild(pre);
+    }
+    det.appendChild(d2);
+   }
+   acc.appendChild(det);
+  }
+ }
+
+ function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+ }
+
+ vscode.postMessage({ command: 'requestData' });
+</script>
+</body>
+</html>`
 	}
-
-	// === Commands ===
-	context.subscriptions.push(
-		vscode.commands.registerCommand('codeTime.showDashboard', showDashboard)
-	)
-
-	// === Listeners ===
-	context.subscriptions.push(
-		vscode.window.onDidChangeActiveTextEditor(recordActivity),
-		vscode.window.onDidChangeTextEditorSelection(recordActivity),
-		vscode.workspace.onDidChangeTextDocument(recordActivity),
-		statusBar
-	)
-
-	// === Start ===
-	recordActivity()
-	updateStatusBar()
-	setInterval(updateStatusBar, 30000)
 }
 
-export function deactivate() {}
+export function deactivate() {
+	// nothing special here — persistent state saved during runtime
+}
