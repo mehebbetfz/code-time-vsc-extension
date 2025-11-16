@@ -3,7 +3,7 @@
 	"name": "dev-code-time-tracker",
 	"displayName": "CodeTime Tracker",
 	"description": "Считает время, потраченное на программирование в VS Code",
-	"version": "1.0.2",
+	"version": "1.0.3",
 	"engines": {
 		"vscode": "^1.85.0"
 	},
