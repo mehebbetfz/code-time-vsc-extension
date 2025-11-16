@@ -1,0 +1,34 @@
+{
+	"publisher": "mefarzaliyevorg",
+	"name": "dev-code-time-tracker",
+	"displayName": "CodeTime Tracker",
+	"description": "Считает время, потраченное на программирование в VS Code",
+	"version": "1.0.1",
+	"engines": {
+		"vscode": "^1.85.0"
+	},
+	"categories": [
+		"Other"
+	],
+	"activationEvents": [
+		"onStartupFinished"
+	],
+	"main": "./out/extension.js",
+	"contributes": {
+		"commands": [
+			{
+				"command": "codeTime.reset",
+				"title": "CodeTime: Сбросить статистику"
+			}
+		]
+	},
+	"scripts": {
+		"compile": "tsc -p ./",
+		"watch": "tsc -watch -p ./"
+	},
+	"devDependencies": {
+		"@types/node": "^24.10.1",
+		"@types/vscode": "^1.85.0",
+		"typescript": "^5.3.0"
+	}
+}
