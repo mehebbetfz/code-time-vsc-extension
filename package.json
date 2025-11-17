@@ -26,6 +26,7 @@
 			}
 		]
 	},
+	"icon": "icon.png",
 	"dependencies": {
 		"chart.js": "^4.5.1",
 		"html-pdf-node": "^1.0.8"

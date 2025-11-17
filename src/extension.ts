@@ -36,6 +36,13 @@ interface LanguageStat {
 	byClassification: Record<Classification, { chars: number; count: number }>
 }
 
+interface DailyStat {
+	date: string
+	totalChars: number
+	totalTime: number
+	byClassification: Record<Classification, { chars: number; count: number }>
+}
+
 interface Aggregate {
 	files: Record<string, FileStat>
 	languages: Record<string, LanguageStat>
@@ -47,7 +54,7 @@ const STORAGE_KEY = 'codingTracker.v1'
 
 export function activate(context: vscode.ExtensionContext) {
 	const output = vscode.window.createOutputChannel('CodingTracker')
-	output.appendLine('CodingTracker activated') // load store
+	output.appendLine('CodingTracker activated')
 
 	let store: Aggregate = context.globalState.get<Aggregate>(STORAGE_KEY) || {
 		files: {},
@@ -112,7 +119,7 @@ export function activate(context: vscode.ExtensionContext) {
 			}
 		}
 		return store.languages[language]
-	} // Time tracking for active editor
+	}
 
 	let lastActiveEditorUri: string | null = null
 	let lastActiveTime = now()
@@ -120,7 +127,7 @@ export function activate(context: vscode.ExtensionContext) {
 	function setActiveEditor(editor: vscode.TextEditor | undefined) {
 		const t = now()
 		if (lastActiveEditorUri) {
-			const delta = (t - lastActiveTime) / 1000 // seconds
+			const delta = (t - lastActiveTime) / 1000
 			const fileStat = store.files[lastActiveEditorUri]
 			if (fileStat) {
 				fileStat.timeSeconds += delta
@@ -149,14 +156,15 @@ export function activate(context: vscode.ExtensionContext) {
 				setActiveEditor(vscode.window.activeTextEditor)
 			}
 		})
-	) // Heuristics thresholds
+	)
 
 	const PASTE_MIN_CHARS = 50
 	const AI_MIN_CHARS = 20
 	const AI_TIME_GAP_MS = 700
 
-	let lastChangeTime = 0
 	let lastWasTyping = false
+	let lastChangeTime = 0
+	let lastKeypressTime = 0
 
 	context.subscriptions.push(
 		vscode.workspace.onDidChangeTextDocument(e => {
@@ -175,27 +183,21 @@ export function activate(context: vscode.ExtensionContext) {
 				const lines = text.length > 0 ? text.split(/\r\n|\r|\n/).length : 0
 
 				let cls: Classification = 'manual'
+				const gap = tNow - lastChangeTime
 
 				if (chars >= PASTE_MIN_CHARS && ch.rangeLength === 0) {
 					cls = 'paste'
 				} else if (chars >= AI_MIN_CHARS) {
-					const gap = tNow - lastChangeTime
-					if (gap <= AI_TIME_GAP_MS && !lastWasTyping) {
+					if (gap <= 50) {
 						cls = 'ai'
-					} else if (gap <= 150 && chars > 0) {
+					} else if (gap <= AI_TIME_GAP_MS && !lastWasTyping) {
 						cls = 'ai'
 					} else {
 						cls = 'manual'
 					}
 				} else {
-					if (chars <= 1) {
-						cls = 'manual'
-					} else {
-						const gap = tNow - lastChangeTime
-						if (gap <= AI_TIME_GAP_MS && !lastWasTyping) cls = 'ai'
-						else cls = 'manual'
-					}
-				} // Update counters
+					cls = 'manual'
+				}
 
 				fileStat.chars += chars
 				fileStat.lines += lines
@@ -226,7 +228,7 @@ export function activate(context: vscode.ExtensionContext) {
 					store.snippets.push(s)
 				}
 
-				lastWasTyping = text.length === 1
+				lastWasTyping = chars === 1 && ch.rangeLength === 0
 				lastChangeTime = tNow
 			}
 
@@ -238,7 +240,7 @@ export function activate(context: vscode.ExtensionContext) {
 		vscode.workspace.onDidCloseTextDocument(_doc => {
 			save()
 		})
-	) // Webview dashboard
+	)
 
 	let panel: vscode.WebviewPanel | undefined = undefined
 
@@ -266,7 +268,7 @@ export function activate(context: vscode.ExtensionContext) {
 		panel.webview.onDidReceiveMessage(msg => {
 			if (msg.command === 'requestData') {
 				sendDataToPanel()
-			} // Логика очистки данных и экспорта JSON удалена по запросу пользователя.
+			}
 		})
 
 		sendDataToPanel()
@@ -276,7 +278,7 @@ export function activate(context: vscode.ExtensionContext) {
 		vscode.commands.registerCommand('codingTracker.openDashboard', () => {
 			createOrShowPanel()
 		})
-	) // Команда 'codingTracker.clearData' полностью удалена по запросу.
+	)
 
 	function startOfDay(ts: number) {
 		const d = new Date(ts)
@@ -332,14 +334,14 @@ export function activate(context: vscode.ExtensionContext) {
 		const today = startOfDay(now())
 		let currentStreak = 0
 		let maxStreak = 0
-		let lastDay = 0 // Sort snippets to process chronologically
+		let lastDay = 0
 
 		const sortedSnippets = [...store.snippets].sort(
 			(a, b) => a.timestamp - b.timestamp
 		)
 
 		const activityDays: Set<number> = new Set()
-		const weekdayCounts = Array(7).fill(0) // 0=Sunday, 6=Saturday // 1. Calculate Activity Days and Weekday Counts
+		const weekdayCounts = Array(7).fill(0)
 
 		for (const sn of sortedSnippets) {
 			const day = startOfDay(sn.timestamp)
@@ -347,7 +349,7 @@ export function activate(context: vscode.ExtensionContext) {
 
 			const d = new Date(sn.timestamp)
 			weekdayCounts[d.getDay()]++
-		} // 2. Calculate Streak
+		}
 
 		const uniqueDays = Array.from(activityDays).sort((a, b) => a - b)
 
@@ -360,21 +362,15 @@ export function activate(context: vscode.ExtensionContext) {
 			}
 			lastDay = day
 		}
-		maxStreak = Math.max(maxStreak, currentStreak) // Adjust current streak if today is not an active day
+		maxStreak = Math.max(maxStreak, currentStreak)
 
 		const yesterday = today - DAY_MS
 		const isActiveToday = activityDays.has(today)
 		const isActiveYesterday = activityDays.has(yesterday)
 
 		if (lastDay === today) {
-			// currentStreak is correct
 		} else if (lastDay === yesterday) {
-			// currentStreak is correct, but since lastDay < today, it's the streak until yesterday
-			// This logic is slightly complex to do reliably outside of a proper date loop, but the above loop handles it:
-			// If the last active day was yesterday, and today is counted, the loop adds +1.
-			// We must subtract 1 if the very last day processed was yesterday and today is inactive.
 			if (!isActiveToday && currentStreak > 0) {
-				// Find the streak *ending* yesterday.
 				let tempStreak = 0
 				let currentDay = yesterday
 				while (activityDays.has(currentDay)) {
@@ -384,28 +380,103 @@ export function activate(context: vscode.ExtensionContext) {
 				currentStreak = tempStreak
 			}
 		} else {
-			// Last active day was before yesterday or 0, current streak is 0
 			currentStreak = isActiveToday ? 1 : 0
 		}
 
 		return {
 			totalEdits: store.snippets.length,
-			currentStreak: Math.max(0, currentStreak), // Ensure non-negative
-			maxStreak: Math.max(0, maxStreak), // Ensure non-negative
+			currentStreak: Math.max(0, currentStreak),
+			maxStreak: Math.max(0, maxStreak),
 			weekdayCounts: weekdayCounts,
 		}
+	}
+
+	// Новая функция для построения статистики по дням
+	function buildDailyStats(): DailyStat[] {
+		const dailyMap: Map<string, DailyStat> = new Map()
+
+		// Собираем данные по дням из сниппетов
+		for (const snippet of store.snippets) {
+			const date = new Date(snippet.timestamp)
+			const dateStr = date.toISOString().split('T')[0] // YYYY-MM-DD
+
+			if (!dailyMap.has(dateStr)) {
+				dailyMap.set(dateStr, {
+					date: dateStr,
+					totalChars: 0,
+					totalTime: 0,
+					byClassification: {
+						manual: { chars: 0, count: 0 },
+						paste: { chars: 0, count: 0 },
+						ai: { chars: 0, count: 0 },
+					},
+				})
+			}
+
+			const dayStat = dailyMap.get(dateStr)!
+			dayStat.totalChars += snippet.chars
+			dayStat.byClassification[snippet.classification].chars += snippet.chars
+			dayStat.byClassification[snippet.classification].count += 1
+		}
+
+		// Собираем данные по времени из файлов
+		for (const file of Object.values(store.files)) {
+			if (file.lastActive) {
+				const date = new Date(file.lastActive)
+				const dateStr = date.toISOString().split('T')[0]
+
+				if (dailyMap.has(dateStr)) {
+					dailyMap.get(dateStr)!.totalTime += file.timeSeconds
+				}
+			}
+		}
+
+		// Сортируем по дате (от новых к старым)
+		return Array.from(dailyMap.values()).sort(
+			(a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
+		)
+	}
+
+	// Новая функция для построения heatmap данных (последние 90 дней)
+	function buildHeatmapData() {
+		const heatmapData: { date: string; value: number }[] = []
+		const dailyStats = buildDailyStats()
+		const today = new Date()
+		today.setHours(0, 0, 0, 0)
+
+		// Создаем данные для последних 90 дней
+		for (let i = 89; i >= 0; i--) {
+			const date = new Date(today)
+			date.setDate(today.getDate() - i)
+			const dateStr = date.toISOString().split('T')[0]
+
+			const dayStat = dailyStats.find(stat => stat.date === dateStr)
+			const value = dayStat ? dayStat.totalChars : 0
+
+			heatmapData.push({
+				date: dateStr,
+				value: value,
+			})
+		}
+
+		return heatmapData
 	}
 
 	function sendDataToPanel() {
 		if (!panel) return
 		const builds = buildTimeWindows()
 		const extraStats = buildExtraStats()
+		const dailyStats = buildDailyStats()
+		const heatmapData = buildHeatmapData()
+
 		panel.webview.postMessage({
 			command: 'update',
 			payload: {
 				store,
 				timeWindows: builds,
 				extraStats: extraStats,
+				dailyStats: dailyStats,
+				heatmapData: heatmapData,
 			},
 		})
 	}
@@ -476,7 +547,7 @@ export function activate(context: vscode.ExtensionContext) {
   box-shadow: 0 4px 12px rgba(0,0,0,0.3);
   transition: transform 0.2s, box-shadow 0.2s;
  }
- .card:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(0,0,0,0.4); }
+ .card:hover { box-shadow: 0 8px 20px rgba(0,0,0,0.4); }
  .controls { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
  button { 
   padding: 8px 12px; border-radius: 8px; background: #1e293b; color: #cbd5e1; 
@@ -517,6 +588,32 @@ export function activate(context: vscode.ExtensionContext) {
  .legend-item { display: flex; justify-content: space-between; padding: 4px 0; font-size: 0.9rem; align-items: center; }
  .legend-item span:first-child { display: flex; align-items: center; }
  .color-box { width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; }
+ 
+ .github-heatmap { 
+  display: grid; 
+  grid-template-columns: repeat(13, 1fr);
+  gap: 2px; 
+  margin: 12px 0;
+ }
+ .heatmap-day { 
+  width: 30px; 
+  height: 30px; 
+  border-radius: 2px;
+  background: #ebedf0;
+ }
+ .heatmap-day-0 { background: #ebedf0; }
+ .heatmap-day-1 { background: #9be9a8; }
+ .heatmap-day-2 { background: #40c463; }
+ .heatmap-day-3 { background: #30a14e; }
+ .heatmap-day-4 { background: #216e39; }
+ .daily-table { width: 100%; font-size: 0.8rem; }
+ .daily-table th { padding: 4px 8px; }
+ .daily-table td { padding: 4px 8px; border-top: 1px solid var(--border); }
+ .classification-bar { display: flex; height: 4px; border-radius: 2px; overflow: hidden; margin-top: 2px; }
+ .classification-manual { background: var(--manual); }
+ .classification-paste { background: var(--paste); }
+ .classification-ai { background: var(--ai); }
+ 
  @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
  .fade-in { animation: fadeIn 0.4s ease-out; }
 </style>
@@ -550,6 +647,39 @@ ${chartJs}
   </div>
  </div>
 
+ <!-- Новая секция: Heatmap активности -->
+ <div style='margin-bottom: 16px' class="card fade-in">
+  <h2>Heatmap активности (90 дней)</h2>
+  <div id="githubHeatmap" class="github-heatmap"></div>
+  <div class="small" style="margin-top: 8px; display: flex; align-items: center; gap: 8px;">
+   <span>Меньше</span>
+   <div class="heatmap-day heatmap-day-0"></div>
+   <div class="heatmap-day heatmap-day-1"></div>
+   <div class="heatmap-day heatmap-day-2"></div>
+   <div class="heatmap-day heatmap-day-3"></div>
+   <div class="heatmap-day heatmap-day-4"></div>
+   <span>Больше</span>
+  </div>
+ </div>
+
+ <!-- Новая секция: Статистика по дням -->
+ <div class="card fade-in">
+  <h2>Статистика по дням</h2>
+  <table class="daily-table" id="dailyStatsTable">
+   <thead>
+    <tr>
+     <th>Дата</th>
+     <th>Всего символов</th>
+     <th>Время</th>
+     <th>Вручную</th>
+     <th>Вставка</th>
+     <th>ИИ</th>
+    </tr>
+   </thead>
+   <tbody id="dailyStatsBody"></tbody>
+  </table>
+ </div>
+
  <h2>Разбивка по вкладу</h2>
  <div class="chart-grid">
   <div class="card fade-in">
@@ -578,13 +708,12 @@ ${chartJs}
   </div>
  </div>
 
- <div class="card fade-in" style="margin-top: 16px;">
+ <div class="card fade-in" style="margin-top: 16px;margin-bottom: 16px;">
   <h2>Активность по дням недели</h2>
   <div id="weekdayChart" class="chart-container">
    <canvas id="weekDayChart"></canvas>
   </div>
  </div>
-
 
  <div class="grid">
   <div class="card fade-in">
@@ -630,23 +759,109 @@ ${chartJs}
  document.getElementById('refresh').onclick = () => vscode.postMessage({ command: 'requestData' });
 
  window.addEventListener('message', e => {
-  const { store, timeWindows, extraStats } = e.data.payload;
-  renderAll(store, timeWindows, extraStats);
+  const { store, timeWindows, extraStats, dailyStats, heatmapData } = e.data.payload;
+  renderAll(store, timeWindows, extraStats, dailyStats, heatmapData);
  });
 
- function renderAll(store, tw, extraStats) {
+ function renderAll(store, tw, extraStats, dailyStats, heatmapData) {
   renderTimeWindows(tw);
   renderSession(store);
   renderStreakInfo(extraStats);
   renderTotalEditsInfo(extraStats);
+  renderDailyStats(dailyStats);
+  renderHeatmap(heatmapData);
   renderClassificationChart(store);
   renderLangPie(store);
   renderWeeklyActivity(extraStats);
   renderTopFiles(store);
   renderTopFolders(store);
-  renderHeatmap(store);
+  renderHourlyHeatmap(store);
   renderLangTable(store.languages);
   renderAccordion(store);
+ }
+
+ // Новая функция для отображения heatmap активности
+ function renderHeatmap(heatmapData) {
+  const container = document.getElementById('githubHeatmap');
+  if (!heatmapData || heatmapData.length === 0) {
+    container.innerHTML = '<div class="small">Нет данных за последние 90 дней</div>';
+    return;
+  }
+
+  // Находим максимальное значение для нормализации
+  const maxValue = Math.max(...heatmapData.map(d => d.value));
+  
+  let html = '';
+  heatmapData.forEach(day => {
+    let level = 0;
+    if (day.value > 0) {
+      const intensity = day.value / maxValue;
+      if (intensity < 0.25) level = 1;
+      else if (intensity < 0.5) level = 2;
+      else if (intensity < 0.75) level = 3;
+      else level = 4;
+    }
+    
+    const date = new Date(day.date);
+    const title = \`\${date.toLocaleDateString('ru-RU')}: \${formatNumber(day.value)} символов\`;
+    html += \`<div class="heatmap-day heatmap-day-\${level}" title="\${title}"></div>\`;
+  });
+  
+  container.innerHTML = html;
+ }
+
+ // Новая функция для отображения статистики по дням
+ function renderDailyStats(dailyStats) {
+  const tbody = document.getElementById('dailyStatsBody');
+  if (!dailyStats || dailyStats.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align: center;">Нет данных</td></tr>';
+    return;
+  }
+
+  let html = '';
+  dailyStats.slice(0, 30).forEach(day => { // Показываем последние 30 дней
+    const date = new Date(day.date);
+    const dateStr = date.toLocaleDateString('ru-RU');
+    const totalChars = day.totalChars;
+    const totalTime = msToTime(day.totalTime);
+    
+    const manualChars = day.byClassification.manual.chars;
+    const pasteChars = day.byClassification.paste.chars;
+    const aiChars = day.byClassification.ai.chars;
+    
+    const totalClassification = manualChars + pasteChars + aiChars;
+    const manualPercent = totalClassification > 0 ? (manualChars / totalClassification * 100).toFixed(1) : '0';
+    const pastePercent = totalClassification > 0 ? (pasteChars / totalClassification * 100).toFixed(1) : '0';
+    const aiPercent = totalClassification > 0 ? (aiChars / totalClassification * 100).toFixed(1) : '0';
+
+    html += \`
+      <tr>
+        <td>\${dateStr}</td>
+        <td>\${formatNumber(totalChars)}</td>
+        <td>\${totalTime}</td>
+        <td>
+          \${formatNumber(manualChars)} (\${manualPercent}%)
+          <div class="classification-bar">
+            <div class="classification-manual" style="width: \${manualPercent}%"></div>
+          </div>
+        </td>
+        <td>
+          \${formatNumber(pasteChars)} (\${pastePercent}%)
+          <div class="classification-bar">
+            <div class="classification-paste" style="width: \${pastePercent}%"></div>
+          </div>
+        </td>
+        <td>
+          \${formatNumber(aiChars)} (\${aiPercent}%)
+          <div class="classification-bar">
+            <div class="classification-ai" style="width: \${aiPercent}%"></div>
+          </div>
+        </td>
+      </tr>
+    \`;
+  });
+  
+  tbody.innerHTML = html;
  }
 
  function renderTimeWindows(tw) {
@@ -715,7 +930,6 @@ ${chartJs}
    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
   });
 
-  // Summary Legend
   const summaryEl = document.getElementById('classSummary');
   summaryEl.innerHTML = \`
    \${renderLegendItem('ИИ (AI)', data.ai, totalChars, 'var(--ai)')}
@@ -729,7 +943,7 @@ ${chartJs}
   const topLangs = langs.slice(0, 5);
   const otherChars = langs.slice(5).reduce((a,l) => a + l.chars, 0);
   
-  const colors = ['#60a5fa','#a78bfa','#f472b6','#fb923c','#facc15','#94a3b8']; // 5 for top, 1 for other
+  const colors = ['#60a5fa','#a78bfa','#f472b6','#fb923c','#facc15','#94a3b8'];
   
   let chartData = topLangs.map(l => l.chars);
   let chartLabels = topLangs.map(l => l.language);
@@ -754,7 +968,6 @@ ${chartJs}
    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
   });
 
-  // Summary Legend
   const summaryEl = document.getElementById('langSummary');
   const totalChars = langs.reduce((a,l) => a + l.chars, 0);
   
@@ -783,11 +996,8 @@ ${chartJs}
   const ctx = document.getElementById('weekDayChart').getContext('2d');
   if (weeklyChart) weeklyChart.destroy();
   
-  // Labels: Пн, Вт, Ср, Чт, Пт, Сб, Вс
   const labels = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
   const data = [...extraStats.weekdayCounts];
-  
-  // Shift data: [Вс, Пн, Вт, Ср, Чт, Пт, Сб] -> [Пн, Вт, Ср, Чт, Пт, Сб, Вс]
   const shiftedData = [...data.slice(1), data[0]];
 
   weeklyChart = new Chart(ctx, {
@@ -835,13 +1045,13 @@ ${chartJs}
   el.innerHTML = top.map(([f,t]) => \`<div class="top-item"><span>\${f}</span><span>\${msToTime(Math.round(t))}</span></div>\`).join('');
  }
 
- function renderHeatmap(store) {
+ function renderHourlyHeatmap(store) {
   const DAY_MS = 24 * 3600 * 1000;
   const THIRTY_DAYS_AGO = Date.now() - 30 * DAY_MS;
   
   const hours = Array(24).fill(0);
   for (const sn of store.snippets) {
-   if (sn.timestamp >= THIRTY_DAYS_AGO) { // Filter for the last 30 days
+   if (sn.timestamp >= THIRTY_DAYS_AGO) {
     const d = new Date(sn.timestamp);
     hours[d.getHours()]++;
    }
@@ -891,11 +1101,9 @@ ${chartJs}
     const s2 = document.createElement('summary');
     s2.textContent = file.file.split(/[\\/]/).pop() + ' — ' + msToTime(Math.round(file.timeSeconds));
     d2.appendChild(s2);
-    // Only show the last 30 snippets
     for (const sn of file.snippets.slice(-30)) {
      const pre = document.createElement('pre');
      pre.className = 'snippet ' + (sn.classification === 'paste' ? 'cls-paste' : sn.classification === 'ai' ? 'cls-ai' : 'cls-manual');
-     // Truncate text to 1500 chars for display
      pre.textContent = sn.text.slice(0, 1500);
      d2.appendChild(pre);
     }
