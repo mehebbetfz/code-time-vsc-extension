@@ -51,6 +51,10 @@ interface Aggregate {
 }
 
 const STORAGE_KEY = 'codingTracker.v1'
+const MAX_SNIPPETS = 1000
+const SAVE_DEBOUNCE_MS = 5000
+const MIN_CHARACTERS_FOR_PASTE = 100
+const MIN_CHARACTERS_FOR_AI = 50
 
 export function activate(context: vscode.ExtensionContext) {
 	const output = vscode.window.createOutputChannel('CodingTracker')
@@ -66,9 +70,34 @@ export function activate(context: vscode.ExtensionContext) {
 	const now = () => Date.now()
 	const uid = () => Math.random().toString(36).slice(2, 9)
 
-	function save() {
-		store.lastUpdate = now()
+	let saveTimeout: NodeJS.Timeout | undefined
+	let lastSaveTime = 0
+
+	function save(force = false) {
+		const nowTime = Date.now()
+		
+		// Дебаунс сохранения
+		if (!force && nowTime - lastSaveTime < SAVE_DEBOUNCE_MS) {
+			if (saveTimeout) {
+				clearTimeout(saveTimeout)
+			}
+			saveTimeout = setTimeout(() => save(true), SAVE_DEBOUNCE_MS)
+			return
+		}
+		
+		// Ограничиваем количество сниппетов
+		if (store.snippets.length > MAX_SNIPPETS) {
+			store.snippets = store.snippets.slice(-MAX_SNIPPETS)
+		}
+		
+		store.lastUpdate = nowTime
+		lastSaveTime = nowTime
 		void context.globalState.update(STORAGE_KEY, store)
+		
+		if (saveTimeout) {
+			clearTimeout(saveTimeout)
+			saveTimeout = undefined
+		}
 	}
 
 	function getFolderFromUri(uri: vscode.Uri) {
@@ -158,43 +187,52 @@ export function activate(context: vscode.ExtensionContext) {
 		})
 	)
 
-	const PASTE_MIN_CHARS = 50
-	const AI_MIN_CHARS = 20
-	const AI_TIME_GAP_MS = 700
-
 	let lastWasTyping = false
 	let lastChangeTime = 0
 	let lastKeypressTime = 0
 
 	context.subscriptions.push(
 		vscode.workspace.onDidChangeTextDocument(e => {
+			// Игнорируем неактивные документы
+			if (!e.document.isDirty) return
+			
 			const doc = e.document
 			const filePath = doc.uri.fsPath
+			
+			// Игнорируем большие изменения (больше 1000 символов за раз)
+			let totalChanges = 0
+			for (const ch of e.contentChanges) {
+				totalChanges += ch.text.length
+			}
+			if (totalChanges > 1000) {
+				return // Игнорируем массовые изменения
+			}
+			
 			const language = doc.languageId || 'unknown'
 			const folder = getFolderFromUri(doc.uri)
 			const fileStat = ensureFileStat(filePath, language, folder)
 			const langStat = ensureLanguageStat(language)
 
 			const tNow = now()
-
+			
+			// Обрабатываем не больше 3 изменений за раз
+			let processedChanges = 0
 			for (const ch of e.contentChanges) {
+				if (processedChanges >= 3) break
+				processedChanges++
+				
 				const text = ch.text || ''
 				const chars = text.length
-				const lines = text.length > 0 ? text.split(/\r\n|\r|\n/).length : 0
+				if (chars === 0) continue
+				
+				const lines = text.split(/\r\n|\r|\n/).length
 
+				// УПРОЩЕННАЯ классификация
 				let cls: Classification = 'manual'
-				const gap = tNow - lastChangeTime
-
-				if (chars >= PASTE_MIN_CHARS && ch.rangeLength === 0) {
+				if (chars >= MIN_CHARACTERS_FOR_PASTE && ch.rangeLength === 0) {
 					cls = 'paste'
-				} else if (chars >= AI_MIN_CHARS) {
-					if (gap <= 50) {
-						cls = 'ai'
-					} else if (gap <= AI_TIME_GAP_MS && !lastWasTyping) {
-						cls = 'ai'
-					} else {
-						cls = 'manual'
-					}
+				} else if (chars >= MIN_CHARACTERS_FOR_AI) {
+					cls = 'ai'
 				} else {
 					cls = 'manual'
 				}
@@ -209,22 +247,19 @@ export function activate(context: vscode.ExtensionContext) {
 				langStat.byClassification[cls].chars += chars
 				langStat.byClassification[cls].count += 1
 
-				if (chars > 0) {
+				// Добавляем сниппет только если достаточно символов
+				if (chars > 10) {
 					const s: SnippetRecord = {
 						id: uid(),
 						file: filePath,
 						folder,
 						language,
-						text:
-							text.length > 1000
-								? text.slice(0, 1000) + '...[truncated]'
-								: text,
+						text: chars > 500 ? text.slice(0, 500) + '...[truncated]' : text,
 						classification: cls,
 						timestamp: tNow,
 						chars,
 						lines,
 					}
-					fileStat.snippets.push(s)
 					store.snippets.push(s)
 				}
 
@@ -236,11 +271,39 @@ export function activate(context: vscode.ExtensionContext) {
 		})
 	)
 
-	context.subscriptions.push(
-		vscode.workspace.onDidCloseTextDocument(_doc => {
-			save()
-		})
-	)
+	function cleanupOldData() {
+		const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000
+		
+		// Очищаем старые сниппеты (старше 30 дней)
+		store.snippets = store.snippets.filter(s => s.timestamp > thirtyDaysAgo)
+		
+		// Очищаем пустые файлы
+		const filesToRemove: string[] = []
+		for (const [path, stat] of Object.entries(store.files)) {
+			if (stat.chars === 0 && stat.timeSeconds < 60) {
+				filesToRemove.push(path)
+			}
+		}
+		for (const path of filesToRemove) {
+			delete store.files[path]
+		}
+		
+		// Очищаем языки без данных
+		const langsToRemove: string[] = []
+		for (const [lang, stat] of Object.entries(store.languages)) {
+			if (stat.chars === 0 && stat.timeSeconds < 60) {
+				langsToRemove.push(lang)
+			}
+		}
+		for (const lang of langsToRemove) {
+			delete store.languages[lang]
+		}
+		
+		save(true)
+	}
+
+	// Очистка старых данных при старте
+	setTimeout(() => cleanupOldData(), 30000)
 
 	let panel: vscode.WebviewPanel | undefined = undefined
 
@@ -391,14 +454,13 @@ export function activate(context: vscode.ExtensionContext) {
 		}
 	}
 
-	// Новая функция для построения статистики по дням
 	function buildDailyStats(): DailyStat[] {
 		const dailyMap: Map<string, DailyStat> = new Map()
 
 		// Собираем данные по дням из сниппетов
 		for (const snippet of store.snippets) {
 			const date = new Date(snippet.timestamp)
-			const dateStr = date.toISOString().split('T')[0] // YYYY-MM-DD
+			const dateStr = date.toISOString().split('T')[0]
 
 			if (!dailyMap.has(dateStr)) {
 				dailyMap.set(dateStr, {
@@ -437,7 +499,6 @@ export function activate(context: vscode.ExtensionContext) {
 		)
 	}
 
-	// Новая функция для построения heatmap данных (последние 90 дней)
 	function buildHeatmapData() {
 		const heatmapData: { date: string; value: number }[] = []
 		const dailyStats = buildDailyStats()
@@ -497,9 +558,18 @@ export function activate(context: vscode.ExtensionContext) {
 	item.show()
 	context.subscriptions.push(item)
 
+	// Периодическая очистка данных (раз в день)
+	const cleanupInterval = setInterval(() => {
+		cleanupOldData()
+	}, 24 * 60 * 60 * 1000)
+
 	context.subscriptions.push({
 		dispose: () => {
-			save()
+			if (saveTimeout) {
+				clearTimeout(saveTimeout)
+			}
+			clearInterval(cleanupInterval)
+			save(true)
 		},
 	})
 
@@ -741,7 +811,7 @@ ${chartJs}
  </div>
 
  <div class="card fade-in" style="margin-top: 16px;">
-  <h2>Недавние фрагменты кода</h2>
+  <h2>Недавние фрагменты кода (топ-10 файлов)</h2>
   <div id="accordion">Загрузка…</div>
  </div>
 
@@ -819,7 +889,7 @@ ${chartJs}
   }
 
   let html = '';
-  dailyStats.slice(0, 30).forEach(day => { // Показываем последние 30 дней
+  dailyStats.slice(0, 30).forEach(day => {
     const date = new Date(day.date);
     const dateStr = date.toLocaleDateString('ru-RU');
     const totalChars = day.totalChars;
@@ -1086,30 +1156,38 @@ ${chartJs}
  function renderAccordion(store) {
   const acc = document.getElementById('accordion');
   acc.innerHTML = '';
-  const byFolder = {};
-  for (const f of Object.values(store.files)) {
-   if (!byFolder[f.folder]) byFolder[f.folder] = [];
-   byFolder[f.folder].push(f);
-  }
-  for (const [folder, files] of Object.entries(byFolder)) {
-   const det = document.createElement('details');
-   const sum = document.createElement('summary');
-   sum.textContent = folder + ' (' + files.length + ' файлов)';
-   det.appendChild(sum);
-   for (const file of files) {
-    const d2 = document.createElement('details');
-    const s2 = document.createElement('summary');
-    s2.textContent = file.file.split(/[\\/]/).pop() + ' — ' + msToTime(Math.round(file.timeSeconds));
-    d2.appendChild(s2);
-    for (const sn of file.snippets.slice(-30)) {
-     const pre = document.createElement('pre');
-     pre.className = 'snippet ' + (sn.classification === 'paste' ? 'cls-paste' : sn.classification === 'ai' ? 'cls-ai' : 'cls-manual');
-     pre.textContent = sn.text.slice(0, 1500);
-     d2.appendChild(pre);
+  
+  // Ограничиваем количество отображаемых файлов (топ-10 по времени)
+  const files = Object.values(store.files)
+    .sort((a, b) => b.timeSeconds - a.timeSeconds)
+    .slice(0, 10);
+  
+  for (const file of files) {
+    // Фильтруем сниппеты для этого файла (только последние 15)
+    const fileSnippets = store.snippets
+      .filter(s => s.file === file.file)
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(0, 15);
+    
+    if (fileSnippets.length === 0) continue;
+    
+    const det = document.createElement('details');
+    const sum = document.createElement('summary');
+    sum.textContent = \`\${file.file.split(/[\\/]/).pop()} — \${msToTime(Math.round(file.timeSeconds))} (\${fileSnippets.length} сниппетов)\`;
+    det.appendChild(sum);
+    
+    for (const sn of fileSnippets) {
+      const pre = document.createElement('pre');
+      pre.className = 'snippet ' + (sn.classification === 'paste' ? 'cls-paste' : sn.classification === 'ai' ? 'cls-ai' : 'cls-manual');
+      pre.textContent = sn.text.length > 300 ? sn.text.slice(0, 300) + '...' : sn.text;
+      pre.title = new Date(sn.timestamp).toLocaleString('ru-RU') + ' • ' + sn.chars + ' символов';
+      det.appendChild(pre);
     }
-    det.appendChild(d2);
-   }
-   acc.appendChild(det);
+    acc.appendChild(det);
+  }
+  
+  if (files.length === 0) {
+    acc.innerHTML = '<div class="small">Нет данных о фрагментах кода</div>';
   }
  }
 
@@ -1125,5 +1203,5 @@ ${chartJs}
 }
 
 export function deactivate() {
-	// nothing special here — persistent state saved during runtime
+	// Сохранение уже обрабатывается в dispose
 }
