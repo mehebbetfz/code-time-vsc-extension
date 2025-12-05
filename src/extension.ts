@@ -24,7 +24,6 @@ interface FileStat {
 	chars: number
 	lines: number
 	byClassification: Record<Classification, { chars: number; count: number }>
-	snippets: SnippetRecord[]
 	lastActive?: number
 }
 
@@ -46,15 +45,12 @@ interface DailyStat {
 interface Aggregate {
 	files: Record<string, FileStat>
 	languages: Record<string, LanguageStat>
-	snippets: SnippetRecord[]
 	lastUpdate: number
+	dailyStats: Record<string, DailyStat>
 }
 
 const STORAGE_KEY = 'codingTracker.v1'
-const MAX_SNIPPETS = 1000
 const SAVE_DEBOUNCE_MS = 5000
-const MIN_CHARACTERS_FOR_PASTE = 100
-const MIN_CHARACTERS_FOR_AI = 50
 
 export function activate(context: vscode.ExtensionContext) {
 	const output = vscode.window.createOutputChannel('CodingTracker')
@@ -63,7 +59,7 @@ export function activate(context: vscode.ExtensionContext) {
 	let store: Aggregate = context.globalState.get<Aggregate>(STORAGE_KEY) || {
 		files: {},
 		languages: {},
-		snippets: [],
+		dailyStats: {},
 		lastUpdate: Date.now(),
 	}
 
@@ -83,11 +79,6 @@ export function activate(context: vscode.ExtensionContext) {
 			}
 			saveTimeout = setTimeout(() => save(true), SAVE_DEBOUNCE_MS)
 			return
-		}
-		
-		// Ограничиваем количество сниппетов
-		if (store.snippets.length > MAX_SNIPPETS) {
-			store.snippets = store.snippets.slice(-MAX_SNIPPETS)
 		}
 		
 		store.lastUpdate = nowTime
@@ -127,7 +118,6 @@ export function activate(context: vscode.ExtensionContext) {
 					paste: { chars: 0, count: 0 },
 					ai: { chars: 0, count: 0 },
 				},
-				snippets: [],
 			}
 		}
 		return store.files[filePath]
@@ -150,6 +140,22 @@ export function activate(context: vscode.ExtensionContext) {
 		return store.languages[language]
 	}
 
+	function ensureDailyStat(dateStr: string): DailyStat {
+		if (!store.dailyStats[dateStr]) {
+			store.dailyStats[dateStr] = {
+				date: dateStr,
+				totalChars: 0,
+				totalTime: 0,
+				byClassification: {
+					manual: { chars: 0, count: 0 },
+					paste: { chars: 0, count: 0 },
+					ai: { chars: 0, count: 0 },
+				},
+			}
+		}
+		return store.dailyStats[dateStr]
+	}
+
 	let lastActiveEditorUri: string | null = null
 	let lastActiveTime = now()
 
@@ -162,6 +168,11 @@ export function activate(context: vscode.ExtensionContext) {
 				fileStat.timeSeconds += delta
 				const langStat = ensureLanguageStat(fileStat.language)
 				langStat.timeSeconds += delta
+				
+				// Обновляем время в статистике за день
+				const dateStr = new Date(t).toISOString().split('T')[0]
+				const dailyStat = ensureDailyStat(dateStr)
+				dailyStat.totalTime += delta
 			}
 		}
 		lastActiveTime = t
@@ -187,9 +198,7 @@ export function activate(context: vscode.ExtensionContext) {
 		})
 	)
 
-	let lastWasTyping = false
 	let lastChangeTime = 0
-	let lastKeypressTime = 0
 
 	context.subscriptions.push(
 		vscode.workspace.onDidChangeTextDocument(e => {
@@ -199,12 +208,12 @@ export function activate(context: vscode.ExtensionContext) {
 			const doc = e.document
 			const filePath = doc.uri.fsPath
 			
-			// Игнорируем большие изменения (больше 1000 символов за раз)
+			// Игнорируем большие изменения (больше 5000 символов за раз)
 			let totalChanges = 0
 			for (const ch of e.contentChanges) {
 				totalChanges += ch.text.length
 			}
-			if (totalChanges > 1000) {
+			if (totalChanges > 5000) {
 				return // Игнорируем массовые изменения
 			}
 			
@@ -212,15 +221,14 @@ export function activate(context: vscode.ExtensionContext) {
 			const folder = getFolderFromUri(doc.uri)
 			const fileStat = ensureFileStat(filePath, language, folder)
 			const langStat = ensureLanguageStat(language)
+			
+			// Получаем статистику за текущий день
+			const dateStr = new Date().toISOString().split('T')[0]
+			const dailyStat = ensureDailyStat(dateStr)
 
 			const tNow = now()
 			
-			// Обрабатываем не больше 3 изменений за раз
-			let processedChanges = 0
 			for (const ch of e.contentChanges) {
-				if (processedChanges >= 3) break
-				processedChanges++
-				
 				const text = ch.text || ''
 				const chars = text.length
 				if (chars === 0) continue
@@ -229,41 +237,36 @@ export function activate(context: vscode.ExtensionContext) {
 
 				// УПРОЩЕННАЯ классификация
 				let cls: Classification = 'manual'
-				if (chars >= MIN_CHARACTERS_FOR_PASTE && ch.rangeLength === 0) {
+				if (chars >= 100 && ch.rangeLength === 0) {
 					cls = 'paste'
-				} else if (chars >= MIN_CHARACTERS_FOR_AI) {
-					cls = 'ai'
+				} else if (chars >= 50) {
+					const gap = tNow - lastChangeTime
+					if (gap <= 100) {
+						cls = 'ai'
+					} else {
+						cls = 'manual'
+					}
 				} else {
 					cls = 'manual'
 				}
 
+				// Обновляем статистику файла
 				fileStat.chars += chars
 				fileStat.lines += lines
 				fileStat.byClassification[cls].chars += chars
 				fileStat.byClassification[cls].count += 1
 
+				// Обновляем статистику языка
 				langStat.chars += chars
 				langStat.lines += lines
 				langStat.byClassification[cls].chars += chars
 				langStat.byClassification[cls].count += 1
 
-				// Добавляем сниппет только если достаточно символов
-				if (chars > 10) {
-					const s: SnippetRecord = {
-						id: uid(),
-						file: filePath,
-						folder,
-						language,
-						text: chars > 500 ? text.slice(0, 500) + '...[truncated]' : text,
-						classification: cls,
-						timestamp: tNow,
-						chars,
-						lines,
-					}
-					store.snippets.push(s)
-				}
+				// Обновляем дневную статистику
+				dailyStat.totalChars += chars
+				dailyStat.byClassification[cls].chars += chars
+				dailyStat.byClassification[cls].count += 1
 
-				lastWasTyping = chars === 1 && ch.rangeLength === 0
 				lastChangeTime = tNow
 			}
 
@@ -274,8 +277,17 @@ export function activate(context: vscode.ExtensionContext) {
 	function cleanupOldData() {
 		const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000
 		
-		// Очищаем старые сниппеты (старше 30 дней)
-		store.snippets = store.snippets.filter(s => s.timestamp > thirtyDaysAgo)
+		// Очищаем старые дневные статистики (старше 90 дней)
+		const daysToRemove: string[] = []
+		for (const [date, stat] of Object.entries(store.dailyStats)) {
+			const dateObj = new Date(date)
+			if (dateObj.getTime() < Date.now() - 90 * 24 * 60 * 60 * 1000) {
+				daysToRemove.push(date)
+			}
+		}
+		for (const date of daysToRemove) {
+			delete store.dailyStats[date]
+		}
 		
 		// Очищаем пустые файлы
 		const filesToRemove: string[] = []
@@ -351,13 +363,15 @@ export function activate(context: vscode.ExtensionContext) {
 
 	function buildTimeWindows() {
 		const t = now()
+		const today = startOfDay(t)
+		
 		const windows = [
 			{
 				id: 'last12h',
 				from: t - 12 * 3600 * 1000,
 				label: 'Последние 12 часов',
 			},
-			{ id: 'today', from: startOfDay(t), label: 'Сегодня' },
+			{ id: 'today', from: today, label: 'Сегодня' },
 			{ id: 'week', from: t - 7 * 24 * 3600 * 1000, label: 'За неделю' },
 			{ id: 'month', from: startOfMonth(t), label: 'За месяц' },
 		]
@@ -366,27 +380,29 @@ export function activate(context: vscode.ExtensionContext) {
 			string,
 			{ seconds: number; chars: number; lines: number }
 		> = {}
+		
+		// Считаем статистику за каждый период
 		for (const w of windows) {
 			let chars = 0
-			let lines = 0
-			for (const sn of store.snippets) {
-				if (sn.timestamp >= w.from) {
-					chars += sn.chars
-					lines += sn.lines
+			let time = 0
+			
+			// Проходим по всем дням и суммируем данные
+			for (const [dateStr, dayStat] of Object.entries(store.dailyStats)) {
+				const date = new Date(dateStr).getTime()
+				if (date >= w.from) {
+					chars += dayStat.totalChars
+					time += dayStat.totalTime
 				}
 			}
-
-			const totalChars = Object.values(store.files).reduce(
-				(acc, f) => acc + f.chars,
-				0
-			)
-			const totalSeconds = Object.values(store.files).reduce(
-				(acc, f) => acc + f.timeSeconds,
-				0
-			)
-			const sec = totalChars > 0 ? (chars / totalChars) * totalSeconds : 0
-
-			results[w.id] = { seconds: Math.round(sec), chars, lines }
+			
+			// Оцениваем количество строк (примерно 1 строка на 50 символов)
+			const lines = Math.round(chars / 50)
+			
+			results[w.id] = { 
+				seconds: Math.round(time), 
+				chars: chars, 
+				lines: lines 
+			}
 		}
 
 		return results
@@ -395,25 +411,26 @@ export function activate(context: vscode.ExtensionContext) {
 	function buildExtraStats() {
 		const DAY_MS = 24 * 3600 * 1000
 		const today = startOfDay(now())
+		
+		// Собираем активные дни из дневной статистики
+		const activityDays: Set<number> = new Set()
+		const weekdayCounts = Array(7).fill(0)
+		
+		for (const [dateStr, dayStat] of Object.entries(store.dailyStats)) {
+			if (dayStat.totalChars > 0) {
+				const date = new Date(dateStr).getTime()
+				activityDays.add(date)
+				
+				const d = new Date(dateStr)
+				weekdayCounts[d.getDay()]++
+			}
+		}
+
+		// Вычисляем серии
 		let currentStreak = 0
 		let maxStreak = 0
 		let lastDay = 0
-
-		const sortedSnippets = [...store.snippets].sort(
-			(a, b) => a.timestamp - b.timestamp
-		)
-
-		const activityDays: Set<number> = new Set()
-		const weekdayCounts = Array(7).fill(0)
-
-		for (const sn of sortedSnippets) {
-			const day = startOfDay(sn.timestamp)
-			activityDays.add(day)
-
-			const d = new Date(sn.timestamp)
-			weekdayCounts[d.getDay()]++
-		}
-
+		
 		const uniqueDays = Array.from(activityDays).sort((a, b) => a - b)
 
 		for (const day of uniqueDays) {
@@ -427,11 +444,13 @@ export function activate(context: vscode.ExtensionContext) {
 		}
 		maxStreak = Math.max(maxStreak, currentStreak)
 
+		// Корректируем текущую серию
 		const yesterday = today - DAY_MS
 		const isActiveToday = activityDays.has(today)
 		const isActiveYesterday = activityDays.has(yesterday)
 
 		if (lastDay === today) {
+			// Уже корректно
 		} else if (lastDay === yesterday) {
 			if (!isActiveToday && currentStreak > 0) {
 				let tempStreak = 0
@@ -446,8 +465,16 @@ export function activate(context: vscode.ExtensionContext) {
 			currentStreak = isActiveToday ? 1 : 0
 		}
 
+		// Считаем общее количество изменений
+		let totalEdits = 0
+		for (const lang of Object.values(store.languages)) {
+			totalEdits += lang.byClassification.ai.count + 
+						  lang.byClassification.paste.count + 
+						  lang.byClassification.manual.count
+		}
+
 		return {
-			totalEdits: store.snippets.length,
+			totalEdits: totalEdits,
 			currentStreak: Math.max(0, currentStreak),
 			maxStreak: Math.max(0, maxStreak),
 			weekdayCounts: weekdayCounts,
@@ -455,53 +482,14 @@ export function activate(context: vscode.ExtensionContext) {
 	}
 
 	function buildDailyStats(): DailyStat[] {
-		const dailyMap: Map<string, DailyStat> = new Map()
-
-		// Собираем данные по дням из сниппетов
-		for (const snippet of store.snippets) {
-			const date = new Date(snippet.timestamp)
-			const dateStr = date.toISOString().split('T')[0]
-
-			if (!dailyMap.has(dateStr)) {
-				dailyMap.set(dateStr, {
-					date: dateStr,
-					totalChars: 0,
-					totalTime: 0,
-					byClassification: {
-						manual: { chars: 0, count: 0 },
-						paste: { chars: 0, count: 0 },
-						ai: { chars: 0, count: 0 },
-					},
-				})
-			}
-
-			const dayStat = dailyMap.get(dateStr)!
-			dayStat.totalChars += snippet.chars
-			dayStat.byClassification[snippet.classification].chars += snippet.chars
-			dayStat.byClassification[snippet.classification].count += 1
-		}
-
-		// Собираем данные по времени из файлов
-		for (const file of Object.values(store.files)) {
-			if (file.lastActive) {
-				const date = new Date(file.lastActive)
-				const dateStr = date.toISOString().split('T')[0]
-
-				if (dailyMap.has(dateStr)) {
-					dailyMap.get(dateStr)!.totalTime += file.timeSeconds
-				}
-			}
-		}
-
-		// Сортируем по дате (от новых к старым)
-		return Array.from(dailyMap.values()).sort(
+		// Просто возвращаем отсортированные дневные статистики
+		return Object.values(store.dailyStats).sort(
 			(a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
 		)
 	}
 
 	function buildHeatmapData() {
 		const heatmapData: { date: string; value: number }[] = []
-		const dailyStats = buildDailyStats()
 		const today = new Date()
 		today.setHours(0, 0, 0, 0)
 
@@ -511,7 +499,7 @@ export function activate(context: vscode.ExtensionContext) {
 			date.setDate(today.getDate() - i)
 			const dateStr = date.toISOString().split('T')[0]
 
-			const dayStat = dailyStats.find(stat => stat.date === dateStr)
+			const dayStat = store.dailyStats[dateStr]
 			const value = dayStat ? dayStat.totalChars : 0
 
 			heatmapData.push({
@@ -632,20 +620,6 @@ export function activate(context: vscode.ExtensionContext) {
  th { color: var(--text-muted); font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.5px; }
  tr:hover td { background: rgba(255,255,255,0.03); }
  .lang-tag { font-weight: 700; color: #e0f2fe; }
- .snippet { 
-  white-space: pre-wrap; padding: 8px; border-radius: 6px; margin: 6px 0; 
-  font-family: 'JetBrains Mono', monospace; font-size: 11px; line-height: 1.4;
-  max-height: 120px; overflow: auto;
- }
- .cls-paste { background: rgba(251,191,36,0.08); border-left: 3px solid var(--paste); }
- .cls-ai { background: rgba(239,68,68,0.08); border-left: 3px solid var(--ai); }
- .cls-manual { background: rgba(52,211,153,0.08); border-left: 3px solid var(--manual); }
- details { margin: 8px 0; }
- summary { 
-  cursor: pointer; padding: 8px; background: rgba(255,255,255,0.03); 
-  border-radius: 6px; font-weight: 600; font-size: 0.95rem;
- }
- summary:hover { background: rgba(255,255,255,0.06); }
  .chart-container { position: relative; height: 180px; margin: 12px 0; }
  .heatmap { display: grid; grid-template-columns: repeat(24, 1fr); gap: 2px; margin: 12px 0; }
  .hour { width: 100%; height: 20px; background: #334155; border-radius: 2px; }
@@ -797,22 +771,11 @@ ${chartJs}
  </div>
 
  <div class="card fade-in" style="margin-top: 16px;">
-  <h2>Почасовая активность (Последние 30 дней)</h2>
-  <div class="heatmap" id="heatmap"></div>
-  <div class="small" style="margin-top: 8px;">Активность на основе количества фрагментов кода в час.</div>
- </div>
-
- <div class="card fade-in" style="margin-top: 16px;">
   <h2>Языки (Подробная таблица)</h2>
   <table id="langTable">
    <thead><tr><th>Язык</th><th>Символы</th><th>Время</th><th>ИИ</th><th>Вставка</th><th>Вручную</th></tr></thead>
    <tbody></tbody>
   </table>
- </div>
-
- <div class="card fade-in" style="margin-top: 16px;">
-  <h2>Недавние фрагменты кода (топ-10 файлов)</h2>
-  <div id="accordion">Загрузка…</div>
  </div>
 
 <script nonce="${nonce}">
@@ -845,9 +808,7 @@ ${chartJs}
   renderWeeklyActivity(extraStats);
   renderTopFiles(store);
   renderTopFolders(store);
-  renderHourlyHeatmap(store);
   renderLangTable(store.languages);
-  renderAccordion(store);
  }
 
  // Новая функция для отображения heatmap активности
@@ -970,8 +931,8 @@ ${chartJs}
  function renderTotalEditsInfo(extraStats) {
   const el = document.getElementById('totalEditsInfo');
   el.innerHTML = \`
-   <div><strong class="stat">\${formatNumber(extraStats.totalEdits)}</strong> Общее количество фрагментов</div>
-   <div class="small">Каждый фрагмент — это одно изменение содержимого.</div>
+   <div><strong class="stat">\${formatNumber(extraStats.totalEdits)}</strong> Общее количество изменений</div>
+   <div class="small">Каждое изменение — это отдельное событие ввода.</div>
   \`;
  }
 
@@ -1075,7 +1036,7 @@ ${chartJs}
    data: {
     labels: labels,
     datasets: [{
-     label: 'Фрагменты кода',
+     label: 'Активные дни',
      data: shiftedData,
      backgroundColor: 'var(--accent)',
      borderColor: 'var(--accent)',
@@ -1115,26 +1076,6 @@ ${chartJs}
   el.innerHTML = top.map(([f,t]) => \`<div class="top-item"><span>\${f}</span><span>\${msToTime(Math.round(t))}</span></div>\`).join('');
  }
 
- function renderHourlyHeatmap(store) {
-  const DAY_MS = 24 * 3600 * 1000;
-  const THIRTY_DAYS_AGO = Date.now() - 30 * DAY_MS;
-  
-  const hours = Array(24).fill(0);
-  for (const sn of store.snippets) {
-   if (sn.timestamp >= THIRTY_DAYS_AGO) {
-    const d = new Date(sn.timestamp);
-    hours[d.getHours()]++;
-   }
-  }
-  
-  const max = Math.max(...hours, 1);
-  const el = document.getElementById('heatmap');
-  el.innerHTML = hours.map((c, i) => {
-   const intensity = c === 0 ? '' : c > max * 0.7 ? 'very-hot' : c > max * 0.3 ? 'hot' : 'active';
-   return \`<div class="hour \${intensity}" title="\${i}:00 — \${c} всего изменений"></div>\`;
-  }).join('');
- }
-
  function renderLangTable(langs) {
   const tbody = document.querySelector('#langTable tbody');
   tbody.innerHTML = '';
@@ -1150,44 +1091,6 @@ ${chartJs}
     <td>\${formatNumber(l.byClassification.manual.chars)}</td>
    \`;
    tbody.appendChild(row);
-  }
- }
-
- function renderAccordion(store) {
-  const acc = document.getElementById('accordion');
-  acc.innerHTML = '';
-  
-  // Ограничиваем количество отображаемых файлов (топ-10 по времени)
-  const files = Object.values(store.files)
-    .sort((a, b) => b.timeSeconds - a.timeSeconds)
-    .slice(0, 10);
-  
-  for (const file of files) {
-    // Фильтруем сниппеты для этого файла (только последние 15)
-    const fileSnippets = store.snippets
-      .filter(s => s.file === file.file)
-      .sort((a, b) => b.timestamp - a.timestamp)
-      .slice(0, 15);
-    
-    if (fileSnippets.length === 0) continue;
-    
-    const det = document.createElement('details');
-    const sum = document.createElement('summary');
-    sum.textContent = \`\${file.file.split(/[\\/]/).pop()} — \${msToTime(Math.round(file.timeSeconds))} (\${fileSnippets.length} сниппетов)\`;
-    det.appendChild(sum);
-    
-    for (const sn of fileSnippets) {
-      const pre = document.createElement('pre');
-      pre.className = 'snippet ' + (sn.classification === 'paste' ? 'cls-paste' : sn.classification === 'ai' ? 'cls-ai' : 'cls-manual');
-      pre.textContent = sn.text.length > 300 ? sn.text.slice(0, 300) + '...' : sn.text;
-      pre.title = new Date(sn.timestamp).toLocaleString('ru-RU') + ' • ' + sn.chars + ' символов';
-      det.appendChild(pre);
-    }
-    acc.appendChild(det);
-  }
-  
-  if (files.length === 0) {
-    acc.innerHTML = '<div class="small">Нет данных о фрагментах кода</div>';
   }
  }
 
